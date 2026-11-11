@@ -1,78 +1,61 @@
-// src/pages/AdminDashboard.jsx
-import { useState, useEffect } from 'react';
+import { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import axiosClient from '../api/axiosClient';
+import SlotGrid from '../components/SlotGrid';
+import useLiveSlots from '../hooks/useLiveSlots';
 import { clearAuth, getAdmin } from '../utils/authStorage';
 
 export default function AdminDashboard() {
   const navigate = useNavigate();
   const admin = getAdmin();
-  const [summary, setSummary] = useState(null);
-  const [error, setError] = useState('');
+  const { slots, connected, loading, error } = useLiveSlots();
 
-  useEffect(() => {
-    fetchSummary();
-  }, []);
-
-  async function fetchSummary() {
-    setError('');
-    try {
-      const res = await axiosClient.get('/slots/summary');
-      setSummary(res.data);
-    } catch (err) {
-      setError(err.response?.data?.error || 'Failed to load dashboard data.');
-    }
-  }
+  const counts = useMemo(() => {
+    const total = slots.length;
+    const occupied = slots.filter((s) => s.occupancy === 'OCCUPIED').length;
+    return { total, occupied, free: total - occupied };
+  }, [slots]);
 
   function handleLogout() {
     clearAuth();
     navigate('/');
   }
 
+  const cards = [
+    { label: 'Total Slots', value: counts.total, bg: 'var(--color-primary-light)', color: 'var(--color-primary-dark)' },
+    { label: 'Occupied', value: counts.occupied, bg: '#fef2f2', color: '#dc2626' },
+    { label: 'Free', value: counts.free, bg: '#ecfdf5', color: '#059669' },
+  ];
+
   return (
-    <div className="page-container">
+    <div className="page-container" style={{ maxWidth: 900 }}>
       <h1 className="page-title">Admin Dashboard</h1>
-      <p className="page-subtitle">Logged in as {admin?.name || 'Admin'}</p>
+      <p className="page-subtitle">
+        Logged in as {admin?.name || 'Admin'} ·{' '}
+        <span style={{ color: connected ? '#059669' : '#9ca3af', fontWeight: 600 }}>
+          ● {connected ? 'Live' : 'Reconnecting…'}
+        </span>
+      </p>
 
       {error && <div className="error-text" style={{ marginBottom: 16 }}>{error}</div>}
+      {loading && <p>Loading slots…</p>}
 
-      {summary && (
-        <div style={{ display: 'flex', gap: '12px', marginBottom: '24px' }}>
-          <div style={{
-            flex: 1, textAlign: 'center', padding: '16px',
-            background: 'var(--color-primary-light)', borderRadius: 'var(--radius)'
-          }}>
-            <div style={{ fontSize: '28px', fontWeight: 700, color: 'var(--color-primary-dark)' }}>
-              {summary.total}
-            </div>
-            <div style={{ fontSize: '13px', color: 'var(--color-text-muted)' }}>Total Slots</div>
+      {!loading && (
+        <>
+          <div style={{ display: 'flex', gap: 12, marginBottom: 24 }}>
+            {cards.map((c) => (
+              <div key={c.label} style={{
+                flex: 1, textAlign: 'center', padding: 16,
+                background: c.bg, borderRadius: 'var(--radius)',
+              }}>
+                <div style={{ fontSize: 28, fontWeight: 700, color: c.color }}>{c.value}</div>
+                <div style={{ fontSize: 13, color: 'var(--color-text-muted)' }}>{c.label}</div>
+              </div>
+            ))}
           </div>
 
-          <div style={{
-            flex: 1, textAlign: 'center', padding: '16px',
-            background: '#fef2f2', borderRadius: 'var(--radius)'
-          }}>
-            <div style={{ fontSize: '28px', fontWeight: 700, color: '#dc2626' }}>
-              {summary.occupied}
-            </div>
-            <div style={{ fontSize: '13px', color: 'var(--color-text-muted)' }}>Occupied</div>
-          </div>
-
-          <div style={{
-            flex: 1, textAlign: 'center', padding: '16px',
-            background: '#ecfdf5', borderRadius: 'var(--radius)'
-          }}>
-            <div style={{ fontSize: '28px', fontWeight: 700, color: '#059669' }}>
-              {summary.free}
-            </div>
-            <div style={{ fontSize: '13px', color: 'var(--color-text-muted)' }}>Free</div>
-          </div>
-        </div>
+          <SlotGrid slots={slots} />
+        </>
       )}
-
-      <button className="btn-primary" onClick={fetchSummary} style={{ marginBottom: '16px' }}>
-        Refresh
-      </button>
 
       <div className="link-row">
         <a onClick={handleLogout} style={{ cursor: 'pointer' }}>Logout</a>
