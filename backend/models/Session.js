@@ -54,6 +54,8 @@ const sessionSchema = new mongoose.Schema(
     enum: ['PENDING', 'PAID'],
     default: 'PENDING',
 },
+  lot: { type: mongoose.Schema.Types.ObjectId, ref: 'Lot', required: true },
+  booking: { type: mongoose.Schema.Types.ObjectId, ref: 'Booking', default: null },
   paymentMethod: {
     type: String,
     enum: ['cash', 'qr', null],
@@ -61,6 +63,12 @@ const sessionSchema = new mongoose.Schema(
 },
   },
   { timestamps: true }
+);
+sessionSchema.index({ lot: 1, status: 1 });
+// one ACTIVE session per vehicle, enforced by the database itself
+sessionSchema.index(
+  { vehicleNumber: 1 },
+  { unique: true, partialFilterExpression: { status: 'ACTIVE' } }
 );
 
 export const Session = mongoose.model('Session', sessionSchema);

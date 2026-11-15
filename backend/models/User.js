@@ -8,12 +8,13 @@ const userSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
-    role: {
+      role: {
       type: String,
-      enum: ['admin', 'vehicleOwner'],
+      enum: ['admin', 'staff', 'vehicleOwner'],
       required: true,
     },
-
+    // staff only: the one lot they work at
+    lot: { type: mongoose.Schema.Types.ObjectId, ref: 'Lot' },
     // ---- Admin-only fields ----
     email: {
       type: String,
@@ -47,10 +48,13 @@ const userSchema = new mongoose.Schema(
 );
 
 userSchema.pre('validate', function () {
-  if (this.role === 'admin') {
+  if (this.role === 'admin' || this.role === 'staff') {
     if (!this.email || !this.passwordHash) {
-      throw new Error('Admin must have email and passwordHash');
+      throw new Error('Admin/staff must have email and password');
     }
+  }
+  if (this.role === 'staff' && !this.lot) {
+    throw new Error('Staff must be assigned to a ParkingLot');
   }
   if (this.role === 'vehicleOwner') {
     if (!this.vehicleNumber || !this.vehicleType || !this.phoneNumber) {
@@ -58,5 +62,4 @@ userSchema.pre('validate', function () {
     }
   }
 });
-
 export const User = mongoose.model('User', userSchema);

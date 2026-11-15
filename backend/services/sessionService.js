@@ -1,185 +1,205 @@
 // services/sessionService.js
+import mongoose from 'mongoose';
 import { Slot } from '../models/Slot.js';
 import { Session } from '../models/Session.js';
 import { Rate } from '../models/Rate.js';
 import { User } from '../models/User.js';
+import { Lot } from '../models/Lot.js';
+import { Booking } from '../models/Booking.js';
 import { recommend } from './recommendationService.js';
 import { calculateDurationMinutes, calculateFare } from './fareService.js';
+import { freeSlotFilter } from './bookingService.js';
 
-// ---- Original manual check-in (slotId pehle se pata ho to) ----
-export async function checkIn({ vehicleNumber, vehicleType, slotId }) {
-  const slot = await Slot.findOneAndUpdate(
-    { _id: slotId, occupancy: 'FREE' },
-    { occupancy: 'OCCUPIED' },
-    { new: true }
+const MAX_ATTEMPTS = 5;
+const VEHICLE_TYPES = ['car', 'bike', 'ev', 'disabled'];
+const PAYMENT_METHODS = ['cash', 'qr'];
+
+// take the slot AND clear any hold on it, in one atomic update
+const OCCUPY_AND_CLEAR = {
+  $set: { occupancy: 'OCCUPIED', 'reservation.status': 'NONE', 'reservation.booking': null },
+  $unset: { 'reservation.reservedFrom': '', 'reservation.reservedUntil': '' },
+};
+
+const cleanNumber = (v) => String(v ?? '').toUpperCase().replace(/\s/g, '');
+
+// puts a slot back exactly as it was if something fails after we claimed it
+async function undoClaim(slotId, booking) {
+  const set = { occupancy: 'FREE', currentSession: null };
+  if (booking) {
+    set['reservation.status'] = 'RESERVED';
+    set['reservation.booking'] = booking._id;
+    set['reservation.reservedFrom'] = booking.createdAt;
+    set['reservation.reservedUntil'] = booking.expiresAt;
+  }
+  await Slot.updateOne({ _id: slotId }, { $set: set });
+}
+
+// the slot this vehicle booked, claimed only if the hold is still theirs
+function claimBookedSlot(booking, lotObjectId) {
+  return Slot.findOneAndUpdate(
+    { _id: booking.slot, lot: lotObjectId, occupancy: 'FREE', 'reservation.booking': booking._id },
+    OCCUPY_AND_CLEAR,
+    { returnDocument: 'after' }
   );
+}
 
+// walk-in: rank the free slots, then try the best few until one claim wins
+async function claimWalkInSlot(lotObjectId, vehicleType) {
+  const filter = freeSlotFilter(lotObjectId, vehicleType, new Date());
+  const free = await Slot.find(filter); // never includes slots held for someone else
+  if (free.length === 0) return null;
+
+  const ranked = recommend(free, { vehicleType });
+  for (const { slot } of ranked.slice(0, MAX_ATTEMPTS)) {
+    const claimed = await Slot.findOneAndUpdate({ _id: slot._id, ...filter }, OCCUPY_AND_CLEAR, {
+      returnDocument: 'after',
+    });
+    if (claimed) return claimed;
+  }
+  return null;
+}
+
+export async function checkInWalkIn({ lotId, name, phoneNumber, vehicleNumber, vehicleType }) {
+  if (!mongoose.isValidObjectId(lotId)) throw new Error('Invalid lot');
+  const lotObjectId = new mongoose.Types.ObjectId(lotId);
+  if (!(await Lot.exists({ _id: lotObjectId }))) throw new Error('Lot not found');
+
+  const number = cleanNumber(vehicleNumber);
+  if (!number) throw new Error('Vehicle number is required');
+
+  if (await Session.findOne({ vehicleNumber: number, status: 'ACTIVE' })) {
+    throw new Error('This vehicle is already checked in');
+  }
+
+  // does this vehicle hold a booking?
+  const now = new Date();
+  let booking = await Booking.findOne({ vehicleNumber: number, status: 'ACTIVE' });
+  if (booking && booking.expiresAt < now) {
+    booking.status = 'EXPIRED';
+    await booking.save();
+    booking = null;
+  }
+  if (booking && !booking.lot.equals(lotObjectId)) {
+    const other = await Lot.findById(booking.lot, 'name area');
+    throw new Error(`This vehicle has a booking at ${other?.name}, ${other?.area}`);
+  }
+
+  // owner: reuse the registered one, else validate the new one now and save it after the claim
+  const owner = await User.findOne({ vehicleNumber: number, role: 'vehicleOwner' });
+  const type = booking?.vehicleType ?? owner?.vehicleType ?? vehicleType;
+  if (!VEHICLE_TYPES.includes(type)) throw new Error('Invalid vehicle type');
+
+  const ownerDoc =
+    owner ??
+    new User({
+      name,
+      phoneNumber: phoneNumber || booking?.phoneNumber,
+      vehicleNumber: number,
+      vehicleType: type,
+      role: 'vehicleOwner',
+    });
+  await ownerDoc.validate();
+
+  // claim a slot: the booked one if there is a booking, otherwise the best free one
+  let slot = null;
+  let source = 'walk-in';
+  if (booking) {
+    slot = await claimBookedSlot(booking, lotObjectId);
+    if (slot) source = 'booking';
+    else booking = null; // hold was lost (e.g. cancelled a moment ago), fall back to walk-in
+  }
   if (!slot) {
-    throw new Error('Slot is not available (already occupied or does not exist)');
+    slot = await claimWalkInSlot(lotObjectId, type);
+    if (!slot) {
+      const total = await Slot.countDocuments({ lot: lotObjectId, type });
+      throw new Error(
+        total === 0 ? `This lot has no ${type} slots` : `No free ${type} slot in this lot right now`
+      );
+    }
   }
 
-  const session = await Session.create({
-    vehicleNumber: vehicleNumber.toUpperCase(),
-    vehicleType,
-    slot: slot._id,
-    slotNumber: slot.slotNumber,
-    checkInTime: new Date(),
-    status: 'ACTIVE',
-  });
-
-  slot.currentSession = session._id;
-  await slot.save();
-
-  return { session, slot };
-}
-
-// ---- Checkout — dono flows (manual aur walk-in) isi ko use karenge ----
-export async function checkOut({ vehicleNumber }) {
-  const session = await Session.findOne({
-    vehicleNumber: vehicleNumber.toUpperCase(),
-    status: 'ACTIVE',
-  });
-
-  if (!session) {
-    throw new Error('No active session found for this vehicle');
+  let session;
+  try {
+    if (!owner) await ownerDoc.save();
+    session = await Session.create({
+      lot: lotObjectId,
+      vehicleNumber: number,
+      vehicleType: type,
+      slot: slot._id,
+      slotNumber: slot.slotNumber,
+      checkInTime: new Date(),
+      status: 'ACTIVE',
+      booking: booking ? booking._id : null,
+    });
+  } catch (err) {
+    await undoClaim(slot._id, booking);
+    if (err.code === 11000) throw new Error('This vehicle is already checked in');
+    throw err;
   }
 
-  const checkOutTime = new Date();
-  const durationMinutes = calculateDurationMinutes(session.checkInTime, checkOutTime);
-
-  const rate = await Rate.findOne({ vehicleType: session.vehicleType });
-  if (!rate) {
-    throw new Error(`No rate configured for vehicle type: ${session.vehicleType}`);
-  }
-
-  const fare = calculateFare(durationMinutes, rate);
-
-  session.checkOutTime = checkOutTime;
-  session.durationMinutes = durationMinutes;
-  session.fare = fare;
-  session.status = 'COMPLETED';
-  await session.save();
-
-  const slot = await Slot.findByIdAndUpdate(
-    session.slot,
-    { occupancy: 'FREE', currentSession: null },
-    { new: true }
+  const finalSlot = await Slot.findByIdAndUpdate(
+    slot._id,
+    { currentSession: session._id },
+    { returnDocument: 'after' }
   );
+  if (booking) {
+    booking.status = 'FULFILLED';
+    await booking.save();
+  }
 
-  return { session, slot };
+  return { owner: ownerDoc, session, slot: finalSlot, source };
 }
-// purana checkOut tha, ab "initiateCheckout" — session ACTIVE hi rehta hai, sirf fare dikhata hai
-export async function initiateCheckout({ vehicleNumber }) {
-  const session = await Session.findOne({
-    vehicleNumber: vehicleNumber.toUpperCase(),
-    status: 'ACTIVE',
-  });
 
-  if (!session) {
-    throw new Error('No active session found for this vehicle');
+function activeSessionQuery(vehicleNumber, lotId) {
+  const query = { vehicleNumber: cleanNumber(vehicleNumber), status: 'ACTIVE' };
+  if (lotId) {
+    if (!mongoose.isValidObjectId(lotId)) throw new Error('Invalid lot');
+    query.lot = lotId;
   }
+  return query;
+}
 
-  const checkOutTime = new Date();
-  const durationMinutes = calculateDurationMinutes(session.checkInTime, checkOutTime);
+// step 1 of checkout: work out the fare, keep the session ACTIVE
+export async function initiateCheckout({ vehicleNumber, lotId }) {
+  const session = await Session.findOne(activeSessionQuery(vehicleNumber, lotId));
+  if (!session) throw new Error('No active session found for this vehicle at this lot');
 
+  const durationMinutes = calculateDurationMinutes(session.checkInTime, new Date());
   const rate = await Rate.findOne({ vehicleType: session.vehicleType });
-  if (!rate) {
-    throw new Error(`No rate configured for vehicle type: ${session.vehicleType}`);
-  }
+  if (!rate) throw new Error(`No rate configured for vehicle type: ${session.vehicleType}`);
 
-  const fare = calculateFare(durationMinutes, rate);
-
-  // sirf fare/duration save karo, session abhi ACTIVE hi rahega
   session.durationMinutes = durationMinutes;
-  session.fare = fare;
+  session.fare = calculateFare(durationMinutes, rate);
   await session.save();
 
   return { session };
 }
 
-// naya function — payment confirm hone par slot free hoga
-export async function confirmPayment({ vehicleNumber, paymentMethod }) {
-  const session = await Session.findOne({
-    vehicleNumber: vehicleNumber.toUpperCase(),
-    status: 'ACTIVE',
-  });
+// step 2: payment received, close the session and free the slot
+export async function confirmPayment({ vehicleNumber, paymentMethod, lotId }) {
+  if (!PAYMENT_METHODS.includes(paymentMethod)) throw new Error('Invalid payment method');
 
+  // atomic: if two clicks arrive together, only one can close the session
+  const session = await Session.findOneAndUpdate(
+    { ...activeSessionQuery(vehicleNumber, lotId), fare: { $ne: null } },
+    {
+      $set: {
+        checkOutTime: new Date(),
+        status: 'COMPLETED',
+        paymentStatus: 'PAID',
+        paymentMethod,
+      },
+    },
+    { returnDocument: 'after' }
+  );
   if (!session) {
-    throw new Error('No pending checkout found for this vehicle');
+    throw new Error('No pending checkout found for this vehicle. Calculate the fare first.');
   }
-  if (!session.fare) {
-    throw new Error('Fare not calculated yet. Please initiate checkout first.');
-  }
-
-  session.checkOutTime = new Date();
-  session.status = 'COMPLETED';
-  session.paymentStatus = 'PAID';
-  session.paymentMethod = paymentMethod;
-  await session.save();
 
   const slot = await Slot.findByIdAndUpdate(
     session.slot,
     { occupancy: 'FREE', currentSession: null },
-    { new: true }
+    { returnDocument: 'after' }
   );
-
   return { session, slot };
-}
-// ---- Walk-in check-in: vehicle number se auto owner-lookup + auto slot assign ----
-export async function checkInWalkIn({ name, phoneNumber, vehicleNumber, vehicleType }) {
-  const upperVehicleNumber = vehicleNumber.toUpperCase();
-
-  // Step 1: Owner dhundo, nahi mila to naya banao
-  let owner = await User.findOne({ vehicleNumber: upperVehicleNumber, role: 'vehicleOwner' });
-  if (!owner) {
-    owner = await User.create({
-      name,
-      phoneNumber,
-      vehicleNumber: upperVehicleNumber,
-      vehicleType,
-      role: 'vehicleOwner',
-    });
-  }
-
-  // Step 2: Check karo ye vehicle already andar to nahi hai
-  const activeSession = await Session.findOne({
-    vehicleNumber: upperVehicleNumber,
-    status: 'ACTIVE',
-  });
-  if (activeSession) {
-    throw new Error('This vehicle is already checked in');
-  }
-
-  // Step 3: Is vehicle type ke saare free slots nikalo, recommendation se best chuno
-  const freeSlots = await Slot.find({ occupancy: 'FREE', type: vehicleType });
-  if (freeSlots.length === 0) {
-    throw new Error('No free slots available for this vehicle type right now');
-  }
-  const ranked = recommend(freeSlots, { vehicleType });
-  const bestSlot = ranked[0].slot;
-
-  // Step 4: Atomic claim (race condition safe)
-  const claimedSlot = await Slot.findOneAndUpdate(
-    { _id: bestSlot._id, occupancy: 'FREE' },
-    { occupancy: 'OCCUPIED' },
-    { new: true }
-  );
-  if (!claimedSlot) {
-    throw new Error('Slot was just taken, please try again');
-  }
-
-  // Step 5: Session banao — yahi checkInTime save hota hai
-  const session = await Session.create({
-    vehicleNumber: upperVehicleNumber,
-    vehicleType,
-    slot: claimedSlot._id,
-    slotNumber: claimedSlot.slotNumber,
-    checkInTime: new Date(),
-    status: 'ACTIVE',
-  });
-
-  claimedSlot.currentSession = session._id;
-  await claimedSlot.save();
-
-  return { owner, session, slot: claimedSlot };
 }

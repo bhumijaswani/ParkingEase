@@ -3,14 +3,18 @@ import mongoose from 'mongoose';
 
 const slotSchema = new mongoose.Schema(
   {
+    lot: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Lot',
+      required: true,
+    },
     slotNumber: {
       type: String,
-      required: true,
-      unique: true, // jaise "A-12" — koi do slots same number ke nahi ho sakte
+      required: true, // "C-1", unique only within a lot (see index below)
     },
     zone: {
       type: String,
-      required: true, // jaise "A", "B" — floor/section
+      required: true, // section inside the lot, e.g. "Car Bay"
     },
     type: {
       type: String,
@@ -19,12 +23,12 @@ const slotSchema = new mongoose.Schema(
     },
     distanceFromEntry: {
       type: Number,
-      required: true, // recommendation engine scoring ke liye use hoga
+      required: true,
     },
     occupancy: {
       type: String,
       enum: ['FREE', 'OCCUPIED'],
-      default: 'FREE', // yeh batata hai vehicle PHYSICALLY hai ya nahi
+      default: 'FREE',
     },
     reservation: {
       status: {
@@ -34,14 +38,19 @@ const slotSchema = new mongoose.Schema(
       },
       reservedFrom: { type: Date },
       reservedUntil: { type: Date },
+      // which booking owns this hold, so cancel/expiry never frees someone else's hold
+      booking: { type: mongoose.Schema.Types.ObjectId, ref: 'Booking', default: null },
     },
     currentSession: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Session',
-      default: null, //  active session ID will be 
+      default: null,
     },
   },
-  { timestamps: true } // createdAt/updatedAt apne aap add ho jayenge
+  { timestamps: true }
 );
+
+slotSchema.index({ lot: 1, slotNumber: 1 }, { unique: true });
+slotSchema.index({ lot: 1, type: 1, occupancy: 1 }); // availability queries
 
 export const Slot = mongoose.model('Slot', slotSchema);
